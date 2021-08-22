@@ -1,0 +1,324 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Parameters:
+  AWSCodeCommitRepo:
+    Type: String
+
+  AWSCodeCommitBranch:
+    Type: String
+  
+  ApprunnerServiceName:
+    Type: String
+    Description: "Please enter the name for the Apprunner service"
+
+  BucketforCanaryCode:
+    Type: String
+    Description: "Please enter the name of the S3 bucket where the code for the canary(Cloudwatch Synthetics) is present."
+
+  SecretManagerSecretArn:
+    Type: String
+    Description: "Please enter the arn of the secret stored in the secret Manager."
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub arn:aws:s3:::${ArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Repository}
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+              - Resource: !Ref SecretManagerSecretArn
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+  
+  AppRunnerECRAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - 'ecr:*'
+
+  CanaryExecServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
+                - docker login --username=$dockerhub_username --password=$dockerhub_password
+                - TAG="latest"
+                - IMAGE_URI="${REPOSITORY_URI}:${TAG}"
+            build:
+              commands:
+                - docker build -t "$IMAGE_URI" .
+            post_build:
+              commands:
+                - docker push "$IMAGE_URI"
+                - printf '{"ImageURI":"%s"}' "$IMAGE_URI" > images.json
+          artifacts:
+            ImageArtifact:
+               files: images.json
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/docker:17.09.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+          - Name: dockerhub_username
+            Value: dockerhub:username
+            Type: SECRETS_MANAGER
+          - Name: dockerhub_password
+            Value: dockerhub:password
+            Type: SECRETS_MANAGER
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref AWSCodeCommitRepo
+                BranchName: !Ref AWSCodeCommitBranch
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+  
+  TestApprunner:
+    Type: 'AWS::AppRunner::Service'
+    Properties:
+      ServiceName: !Ref ApprunnerServiceName
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerECRAccessRole.Arn
+        AutoDeploymentsEnabled: true
+        ImageRepository:
+          ImageIdentifier: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}:latest
+          ImageConfiguration:
+            Port: 3000
+          ImageRepositoryType: ECR
+          
+  TestCanaryApprunner:
+    Properties:
+      Name: test-canary-apprunner
+      ExecutionRoleArn: !GetAtt CanaryExecServiceRole.Arn
+      Code:
+        Handler: customer-canary.handler
+        S3Bucket: !Ref BucketforCanaryCode
+        S3Key: python.zip
+      ArtifactS3Location: !Sub s3://${BucketforCanaryCode}
+      Runtimeversion: syn-python-selenium-1.0
+      Schedule:
+        Expression: rate(1 minute)
+        DurationInseconds: '3600'
+      Runconfig:
+        TimeoutInseconds: '60'
+        EnvironmentVariables:
+          urlPostList: ""
+          urlGetList: !Join 
+            - ''
+            - - 'https://'
+              - !GetAtt 
+                - TestApprunner
+                - ServiceUrl
+      FailureRetentionPeriod: '30'
+      Successretentionperiod: '30'
+      Tags:
+        - Key: Product
+          Value: lzo
+      StartCanaryAfterCreation: 'True'
+    Type: 'AWS::Synthetics::Canary'
+    
+  SampleapicanaryAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: sampleapicanaryAlarmTestApprunner
+      AlarmDescription: The CloudWatch Synthetics Canary that monitors the Application
+      ActionsEnabled: true
+      AlarmActions:
+        - 'arn:aws:sns:us-east-1:911318180432:canaryalarm.fifo'
+      Namespace: CloudWatchSynthetics
+      MetricName: Failed
+      Dimensions:
+        - Name: CanaryName
+          Value: !Ref TestCanaryApprunner
+      Statistic: Average
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+
+  Defaultdomain:
+    Description: Default Domain of the apprunner service
+    Value: !Join 
+      - ''
+      - - 'https://'
+        - !GetAtt 
+          - TestApprunner
+          - ServiceUrl
+    
